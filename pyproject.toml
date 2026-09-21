@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "github-migration-tool"
+version = "0.1.0"
+description = "Move GitHub repositories from one account to another via GitHub's native transfer."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+gh-migrate = "gh_migrate.cli:main"
+
+[tool.setuptools]
+packages = ["gh_migrate"]
