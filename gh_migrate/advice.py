@@ -1,14 +1,11 @@
-"""Turn blocked and failed repositories into concrete steps the user can take."""
+"""Turn blocked and failed repositories into short, concrete next steps."""
 
 import os
 from dataclasses import dataclass
 
 from .migrate import ALREADY_TAKEN, MOVED, NAME_TAKEN, NO_ADMIN, NOT_FOUND, REFUSED, same
 
-DOCS_URL = "https://docs.github.com/en/repositories/creating-and-managing-repositories/transferring-a-repository"
-TOKENS_URL = "https://github.com/settings/tokens"
-
-# Advice body lines: "## " starts a sub-heading, "$ " is a command to run, anything else is prose.
+# Body lines starting with "$ " are commands to run; anything else is prose.
 
 
 @dataclass
@@ -47,14 +44,18 @@ def advise(tasks, ctx):
     if NO_ADMIN in names:
         items.append(_grant_admin(ctx, names[NO_ADMIN]))
     if NOT_FOUND in names:
-        items.append(_find_repos(ctx, names[NOT_FOUND]))
+        items.append(Advice(f"Not found: {_list(names[NOT_FOUND])}", [
+            "Check the spelling, or list what exists:",
+            f"$ gh repo list {ctx.source} --limit 200",
+        ]))
     if NAME_TAKEN in names:
-        items.append(_name_taken(ctx, names[NAME_TAKEN]))
+        items.append(Advice(f"{ctx.target} already has: {_list(names[NAME_TAKEN])}", [
+            "Rename or delete them there, then re-run.",
+        ]))
     if MOVED in names:
-        items.append(Advice(
-            f"Use the current name of {_list(names[MOVED])}",
-            ["These repositories were renamed or moved; the detail above shows where they are now."],
-        ))
+        items.append(Advice(f"Renamed or moved: {_list(names[MOVED])}", [
+            "Use the current names shown above.",
+        ]))
     if ALREADY_TAKEN in names:
         items.append(_already_taken(ctx, names[ALREADY_TAKEN]))
     if REFUSED in names:
@@ -66,107 +67,47 @@ def _list(names):
     return ", ".join(names)
 
 
-def _sign_in_as_source(ctx):
-    body = [
-        f"You're authenticated as {ctx.me}, but these repositories belong to {ctx.source}. Only "
-        f"{ctx.source} can transfer them; other accounts can at most read them."
-    ]
-    if ctx.token_origin and ctx.token_origin.startswith("$"):
-        body += [
-            f"The token came from the {ctx.token_origin[1:]} environment variable and belongs to {ctx.me}. "
-            f"Replace it with a token created while signed in as {ctx.source}:",
-            *_set_token_lines(ctx),
-        ]
-    else:
-        body += [
-            "## Option A: GitHub CLI",
-            "$ gh auth login",
-            f"Choose GitHub.com and sign in as {ctx.source} in the browser (sign out of {ctx.me} on "
-            f"github.com first, or use a private window). The tool finds the {ctx.source} login "
-            "automatically, there's nothing to switch.",
-            "## Option B: personal access token",
-            f"While signed in as {ctx.source}, create a classic token with the 'repo' scope at "
-            f"{TOKENS_URL}, then:",
-            *_set_token_lines(ctx),
-        ]
-    body.append("Then re-run the same command.")
-    return Advice(f"Sign in as {ctx.source}", body)
-
-
-def _set_token_lines(ctx):
+def _set_token(ctx):
     if ctx.windows:
-        return ['$ $env:GH_MIGRATE_TOKEN = "ghp_..."']
-    return ["$ export GH_MIGRATE_TOKEN=ghp_..."]
+        return '$ $env:GH_MIGRATE_TOKEN = "ghp_..."'
+    return "$ export GH_MIGRATE_TOKEN=ghp_..."
+
+
+def _sign_in_as_source(ctx):
+    heading = f"Sign in as {ctx.source}, not {ctx.me}"
+    if ctx.token_origin and ctx.token_origin.startswith("$"):
+        return Advice(heading, [
+            f"Your {ctx.token_origin[1:]} variable is {ctx.me}'s token. Replace it:",
+            _set_token(ctx),
+        ])
+    return Advice(heading, [
+        "$ gh auth login",
+        f"Use a private window if your browser is signed in as {ctx.me}. Or set a token for {ctx.source}:",
+        _set_token(ctx),
+    ])
 
 
 def _grant_admin(ctx, names):
     if ctx.source_is_org:
-        body = [
-            f"{ctx.source} is an organization: you must be an organization owner, or have the Admin "
-            "role on the repository. Ask an owner to grant it (repository Settings > Collaborators "
-            "and teams) or to run this tool themselves.",
-            f"If {ctx.source} enforces SAML SSO, also authorize your token for it "
-            f"({TOKENS_URL} > Configure SSO).",
-        ]
-    else:
-        body = [
-            f"You're signed in as {ctx.source}, but the token doesn't grant admin access. Use a "
-            "classic token with the 'repo' scope, or a fine-grained token with Repository "
-            "permission 'Administration: Read and write' on these repositories.",
-            f"Create one at {TOKENS_URL}, then:",
-            *_set_token_lines(ctx),
-        ]
-    return Advice(f"Get admin access to {_list(names)}", body)
-
-
-def _find_repos(ctx, names):
-    return Advice(
-        f"Check the name of {_list(names)}",
-        [
-            f"No repository with that name was found under {ctx.source}. Check the spelling, that "
-            "your token can see private repositories, and that it hasn't already been transferred. "
-            "To list what exists:",
-            f"$ gh repo list {ctx.source} --limit 200",
-        ],
-    )
-
-
-def _name_taken(ctx, names):
-    return Advice(
-        f"Free up the name in {ctx.target}: {_list(names)}",
-        [
-            f"{ctx.target} already has a repository with that name. Rename or delete it (repository "
-            "Settings > General) and re-run. The tool never overwrites anything.",
-        ],
-    )
+        return Advice(f"Ask an owner of {ctx.source} for admin access: {_list(names)}", [
+            "Owners and repo admins can transfer. If SAML SSO is enforced, authorize your token for it.",
+        ])
+    return Advice(f"Use a token with admin access: {_list(names)}", [
+        "Classic 'repo' scope, or fine-grained 'Administration: Read and write':",
+        _set_token(ctx),
+    ])
 
 
 def _already_taken(ctx, names):
-    return Advice(
-        f"Look for a transfer that's already in progress: {_list(names)}",
-        [
-            f"GitHub says the repository is 'already taken' at {ctx.target}. If the tool couldn't see "
-            f"anything under that name in {ctx.target}, the most likely cause is a transfer request for "
-            f"it that's already pending, for example one started earlier from the web UI. Nothing was "
-            "moved by this run.",
-            "## Check for a pending request",
-            f"In the email inbox (and spam folder) of {ctx.target}, look for a GitHub email about a "
-            f"repository transfer from {ctx.source}. Accepting it completes the migration.",
-            f"Or, signed in as {ctx.source}, open the repository's Settings page and look in the Danger "
-            "Zone for a pending transfer. Cancel it there, then re-run.",
-            "## Rule out a name clash",
-            f"Check that {ctx.target} has no repository with that name, including one deleted "
-            "recently (Settings > Repositories > Deleted repositories).",
-        ],
-    )
+    return Advice(f"Already pending, or name taken: {_list(names)}", [
+        f"Look for a transfer request in {ctx.target}'s email (and spam) and accept it,",
+        "or cancel it in the repo's Settings > Danger Zone and re-run. Also check for a deleted repo "
+        f"with that name in {ctx.target}.",
+    ])
 
 
 def _refused(ctx, names):
-    body = [
-        f"GitHub rejected the transfer of {_list(names)}; its reason is shown above. Nothing was "
-        "moved for these, so it's safe to fix the cause and re-run.",
-    ]
+    body = ["Reason shown above. Nothing was moved; fix it and re-run."]
     if ctx.target_is_org:
-        body.append(f"{ctx.target} is an organization: you need permission to create repositories there.")
-    body.append(f"Docs: {DOCS_URL}")
-    return Advice("Resolve GitHub's objection", body)
+        body.append(f"You need permission to create repositories in {ctx.target}.")
+    return Advice(f"GitHub refused: {_list(names)}", body)

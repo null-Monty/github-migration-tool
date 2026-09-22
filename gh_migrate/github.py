@@ -59,7 +59,8 @@ class GitHubClient:
 
 def _error_message(err):
     """GitHub's headline plus the specifics it puts in `errors` (e.g. why a 422 failed validation)."""
-    raw = err.read().decode(errors="replace")
+    with err:
+        raw = err.read().decode(errors="replace")
     try:
         body = json.loads(raw)
         message = body["message"]

@@ -8,8 +8,8 @@ import textwrap
 STYLES = {"bold": "1", "dim": "2", "red": "31", "green": "32", "yellow": "33", "cyan": "36"}
 
 GLYPHS = {
-    True: {"ok": "✓", "fail": "✗", "warn": "▲", "wait": "○", "arrow": "→", "rule": "─"},
-    False: {"ok": "+", "fail": "x", "warn": "!", "wait": "o", "arrow": "->", "rule": "-"},
+    True: {"ok": "✓", "fail": "✗", "warn": "▲", "wait": "○", "arrow": "→"},
+    False: {"ok": "+", "fail": "x", "warn": "!", "wait": "o", "arrow": "->"},
 }
 
 
@@ -64,8 +64,3 @@ class Console:
     def wrapped(self, text, indent):
         for row in self.wrap(text, indent):
             self.line(" " * indent + row)
-
-    def heading(self, text):
-        self.line()
-        self.line("  " + self.paint(text, "bold"))
-        self.line("  " + self.paint(self.glyph("rule") * (self.width - 4), "dim"))

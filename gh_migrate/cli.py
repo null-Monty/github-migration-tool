@@ -3,14 +3,14 @@
 import argparse
 import sys
 
-from .advice import Context, advise, wrong_account
+from .advice import Context, advise
 from .github import ApiError, GitHubClient, resolve_token
 from .migrate import (
     ALREADY, BLOCKED, DONE, FAILED, PENDING, READY, UNVERIFIED, VERIFIED, preflight, same, transfer_all,
 )
 from .ui import Console
 
-EXIT_OK, EXIT_FAILED, EXIT_PENDING = 0, 1, 2
+EXIT_OK, EXIT_FAILED, EXIT_PENDING = 0, 1, 3  # 2 is argparse's usage-error code
 
 # status -> (glyph, colour)
 LOOK = {
@@ -23,21 +23,19 @@ LOOK = {
     FAILED: ("fail", "red"),
 }
 STATUS_WIDTH = max(len(status) for status in LOOK)
-VISIBILITY_WIDTH = len("private") + 2
 
 
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="gh-migrate",
-        description="Move GitHub repositories from one account to another using GitHub's "
-        "native repository transfer, so issues, PRs, stars, wikis, releases and settings "
-        "move with them and nothing is left in the source account.",
+        description="Move GitHub repositories to another account using GitHub's native transfer, "
+        "so issues, PRs, stars and settings move with them.",
     )
-    parser.add_argument("--source", required=True, help="account (user or org) that owns the repositories now")
-    parser.add_argument("--target", required=True, help="account (user or org) that should own them")
+    parser.add_argument("--source", required=True, help="account that owns the repositories now")
+    parser.add_argument("--target", required=True, help="account that should own them")
     parser.add_argument("repos", nargs="*", metavar="REPO", help="repository names to move")
     parser.add_argument("-f", "--repos-file", help="file with one repository name per line (# comments allowed)")
-    parser.add_argument("--dry-run", action="store_true", help="run all checks but transfer nothing")
+    parser.add_argument("--dry-run", action="store_true", help="check everything, transfer nothing")
     parser.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
     parser.add_argument("--wait", type=int, default=120, metavar="SECONDS",
                         help="how long to wait for transfers to complete (default: 120)")
@@ -76,8 +74,7 @@ def main(argv=None, *, client=None):
     if client is None:
         found = resolve_token(args.source)
         if not found:
-            parser.error(f"no GitHub token found; run `gh auth login` as {args.source}, "
-                         "or set GH_MIGRATE_TOKEN")
+            parser.error("no GitHub token found; run `gh auth login` or set GH_MIGRATE_TOKEN")
         token, origin = found
         client = GitHubClient(token)
 
@@ -86,124 +83,136 @@ def main(argv=None, *, client=None):
         return run(client, args, names, out, origin)
     except ApiError as err:
         out.line()
-        out.line("  " + out.paint(f"{out.glyph('fail')} GitHub API error: {err}", "red"))
+        bullet(out, out.paint(out.glyph("fail"), "red"), f"GitHub API error: {err}", "red")
         return EXIT_FAILED
     except KeyboardInterrupt:
         out.line()
-        out.line("  " + out.paint("Interrupted. Any transfer already requested continues on GitHub's side.", "yellow"))
+        bullet(out, out.paint(out.glyph("warn"), "yellow"),
+               "Interrupted. Transfers already requested continue on GitHub's side.", "yellow")
         return EXIT_FAILED
 
 
-def run(gh, args, names, out, token_origin):
-    source, target = args.source, args.target
-    paint, glyph = out.paint, out.glyph
+def notice(out, kind, text):
+    color = {"ok": "green", "warn": "yellow", "fail": "red"}[kind]
+    bullet(out, out.paint(out.glyph(kind), color), text, color)
 
-    def notice(kind, text):
-        color = {"ok": "green", "warn": "yellow", "fail": "red"}[kind]
-        first, *rest = out.wrap(text, 4)
-        out.line("  " + paint(glyph(kind), color) + " " + paint(first, color))
-        for row in rest:
-            out.line("    " + paint(row, color))
 
-    title = paint("gh-migrate", "bold") + "  " + paint(source, "cyan", "bold") \
-        + f" {paint(glyph('arrow'), 'dim')} " + paint(target, "cyan", "bold")
-    out.line()
-    out.line("  " + title + (paint("  (dry run)", "yellow") if args.dry_run else ""))
-    out.line()
+def show_task(out, task, width):
+    symbol, color = LOOK[task.status]
+    status = task.status.ljust(STATUS_WIDTH) if task.detail else task.status
+    out.line("  " + out.paint(out.glyph(symbol), color) + " " + task.name.ljust(width) + "  "
+             + out.paint(status, color) + (out.paint("  " + task.detail, "dim") if task.detail else ""))
 
+
+def connect(gh, args, out, token_origin):
+    """Look up who we are and both accounts. Returns a Context, or None after saying what's wrong."""
     me = gh.get("/user")["login"]
     accounts = {}
-    for account in (source, target):
+    for account in (args.source, args.target):
         accounts[account] = gh.get(f"/users/{account}")
         if accounts[account] is None:
-            notice("fail", f"Account '{account}' does not exist on GitHub.")
-            return EXIT_FAILED
-    ctx = Context(
-        me=me, source=source, target=target,
-        source_is_org=accounts[source]["type"] == "Organization",
-        target_is_org=accounts[target]["type"] == "Organization",
+            out.line()
+            notice(out, "fail", f"Account '{account}' does not exist.")
+            return None
+    return Context(
+        me=me, source=args.source, target=args.target,
+        source_is_org=accounts[args.source]["type"] == "Organization",
+        target_is_org=accounts[args.target]["type"] == "Organization",
         token_origin=token_origin,
     )
 
-    origin_note = f"  {paint(f'({token_origin})', 'dim')}" if token_origin else ""
-    out.line(f"  Signed in as  {paint(me, 'bold')}{origin_note}")
-    if wrong_account(ctx):
-        notice("warn", f"{source} is a different account, so its repositories can't be transferred with this login.")
 
-    width = max(len(name) for name in names)
+def print_header(out, args, me):
+    paint = out.paint
+    out.line()
+    out.line("  " + paint("gh-migrate", "bold") + "  " + paint(args.source, "cyan", "bold")
+             + f" {paint(out.glyph('arrow'), 'dim')} " + paint(args.target, "cyan", "bold")
+             + (paint("  (dry run)", "yellow") if args.dry_run else ""))
+    out.line("  " + paint(f"signed in as {me}", "dim"))
+    out.line()
 
-    def show(task):
-        symbol, color = LOOK[task.status]
-        visibility = {None: "-", True: "private", False: "public"}[task.private]
-        out.line("  " + paint(glyph(symbol), color) + " " + task.name.ljust(width) + "  "
-                 + paint(visibility.ljust(VISIBILITY_WIDTH), "dim")
-                 + paint(task.status.ljust(STATUS_WIDTH + 2) if task.detail else task.status, color)
-                 + paint(task.detail, "dim"))
 
-    out.heading(f"Checking {len(names)} {'repository' if len(names) == 1 else 'repositories'}")
-    tasks = [preflight(gh, source, target, name) for name in names]
-    for task in tasks:
-        show(task)
+def run(gh, args, names, out, token_origin):
+    ctx = connect(gh, args, out, token_origin)
+    if ctx is None:
+        return EXIT_FAILED
+    print_header(out, args, ctx.me)
+
+    tasks = [preflight(gh, args.source, args.target, name) for name in names]
+    if all(task.status == READY for task in tasks):
+        notice(out, "ok", f"{len(tasks)} ready: {', '.join(task.name for task in tasks)}")
+    else:
+        for task in tasks:
+            show_task(out, task, max(len(name) for name in names))
 
     blocked = [task for task in tasks if task.status == BLOCKED]
     if blocked:
         out.line()
-        notice("fail", f"{len(blocked)} of {len(tasks)} can't be transferred. Nothing was changed.")
+        notice(out, "fail", f"{len(blocked)} blocked. Nothing was changed.")
         show_advice(out, advise(tasks, ctx))
         return EXIT_FAILED
 
     todo = [task for task in tasks if task.status == READY]
     if not todo:
         out.line()
-        notice("ok", "Nothing to do: everything is already at the target.")
+        notice(out, "ok", "Nothing to do.")
         return EXIT_OK
     if args.dry_run:
-        out.line()
-        notice("ok", f"Dry run passed: {len(todo)} ready to transfer. Nothing was changed.")
-        out.line(f"    Run the same command without {paint('--dry-run', 'cyan')} to transfer them.")
+        out.line("    " + out.paint("Dry run: nothing changed. Re-run without --dry-run to transfer.", "dim"))
         return EXIT_OK
 
     if not ctx.target_is_org:
+        notice(out, "warn", f"{args.target} is a personal account and must accept each transfer by email.")
+    if not args.yes and not confirmed(out, args.target, len(todo)):
         out.line()
-        notice("warn", f"{target} is a personal account: GitHub will email them one transfer request per "
-                       "repository, which they must accept (requests expire after about a day).")
-    if not args.yes and not confirmed(out, target, len(todo)):
-        out.line()
-        notice("fail", "Aborted. Nothing was changed.")
+        notice(out, "fail", "Aborted. Nothing was changed.")
         return EXIT_FAILED
 
-    out.heading("Transferring")
-    transfer_all(gh, source, target, todo, wait=args.wait, on_update=show)
+    out.line()
+    width = max(len(name) for name in names)
+    transfer_all(gh, args.source, args.target, todo, wait=args.wait,
+                 on_update=lambda task: show_task(out, task, width))
+    return summarize(out, tasks, ctx)
 
+
+def summarize(out, tasks, ctx):
+    """Print the outcome counts, any advice and next steps; return the exit code."""
     failed = [task for task in tasks if task.status == FAILED]
     pending = [task for task in tasks if task.status == PENDING]
     done = [task for task in tasks if task.status in DONE]
+    counts = (
+        (done, "done", "ok", "green"),
+        (pending, "pending", "wait", "yellow"),
+        (failed, "failed", "fail", "red"),
+    )
     out.line()
-    out.line("  " + "   ".join([
-        paint(f"{len(done)} done", "green" if done else "dim"),
-        paint(f"{len(pending)} pending", "yellow" if pending else "dim"),
-        paint(f"{len(failed)} failed", "red" if failed else "dim"),
-    ]))
+    out.line("  " + "   ".join(
+        out.paint(f"{out.glyph(symbol)} {len(group)} {label}", color)
+        for group, label, symbol, color in counts if group
+    ))
     if failed:
         show_advice(out, advise(tasks, ctx))
     if pending:
-        out.heading("Next step")
-        out.wrapped(f"{target} needs to accept the transfer request(s) GitHub emailed them. Once they have, "
-                    "re-run the same command to confirm; repositories that have arrived show as "
-                    "'already migrated'.", 4)
+        out.line()
+        out.wrapped(f"{ctx.target} must accept the emailed request(s); then re-run this command to confirm.", 2)
         if not ctx.target_is_org:
-            out.wrapped(f"No email? Check spam, and that {target} has a verified email address at "
-                        "https://github.com/settings/emails.", 4)
+            out.wrapped("No email? Check spam and https://github.com/settings/emails", 2)
     if failed:
         return EXIT_FAILED
     return EXIT_PENDING if pending else EXIT_OK
 
 
+def bullet(out, mark, text, *styles):
+    """`  <mark> text`, wrapped with a hanging indent."""
+    first, *rest = out.wrap(text, 4)
+    out.line("  " + mark + " " + out.paint(first, *styles))
+    for row in rest:
+        out.line("    " + out.paint(row, *styles))
+
+
 def confirmed(out, target, count):
     noun = "repository" if count == 1 else "repositories"
-    out.line()
-    out.line("  " + out.paint("Waiting for confirmation. Nothing has been transferred yet.", "yellow", "bold"))
-    prompt = f"  {out.paint('?', 'cyan', 'bold')} Type {out.paint(target, 'cyan', 'bold')} and press Enter to transfer {count} {noun}: "
+    prompt = f"  {out.paint('?', 'cyan', 'bold')} " + out.paint(f"Type {target} to transfer {count} {noun}: ", "bold")
     try:
         answer = input(prompt)
     except EOFError:
@@ -212,19 +221,14 @@ def confirmed(out, target, count):
 
 
 def show_advice(out, items):
-    if not items:
-        return
-    out.heading("How to unblock")
-    for number, item in enumerate(items, 1):
+    for item in items:
         out.line()
-        out.line("  " + out.paint(f"{number}.", "cyan", "bold") + " " + out.paint(item.heading, "bold"))
+        bullet(out, out.paint(out.glyph("arrow"), "cyan", "bold"), item.heading, "bold")
         for text in item.body:
             if text.startswith("$ "):
-                out.line("       " + out.paint(text, "cyan"))
-            elif text.startswith("## "):
-                out.line("     " + out.paint(text[3:], "dim", "bold"))
+                out.line("      " + out.paint(text, "cyan"))
             else:
-                out.wrapped(text, 5)
+                out.wrapped(text, 4)
 
 
 if __name__ == "__main__":

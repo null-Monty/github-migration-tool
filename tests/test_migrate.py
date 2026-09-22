@@ -97,7 +97,7 @@ class PreflightTests(unittest.TestCase):
     def test_ready(self):
         self.gh.add_repo("old", "app", private=True)
         task = preflight(self.gh, "old", "new", "APP")
-        self.assertEqual((task.name, task.status, task.private), ("app", READY, True))
+        self.assertEqual((task.name, task.status), ("app", READY))
 
     def test_missing_repo_is_blocked(self):
         self.assertEqual(preflight(self.gh, "old", "new", "nope").status, BLOCKED)
@@ -113,7 +113,7 @@ class PreflightTests(unittest.TestCase):
         self.gh.add_repo("new", "app")
         task = preflight(self.gh, "old", "new", "app")
         self.assertEqual(task.status, BLOCKED)
-        self.assertIn("already has", task.detail)
+        self.assertIn("name taken", task.detail)
 
     def test_already_at_target(self):
         self.gh.add_repo("new", "app")
@@ -165,7 +165,7 @@ class TransferTests(unittest.TestCase):
         ctx = Context(me="old", source="old", target="new", source_is_org=False, target_is_org=False)
         headings = [item.heading for item in advise(tasks, ctx)]
         self.assertEqual(headings, [
-            "Look for a transfer that's already in progress: taken-repo", "Resolve GitHub's objection",
+            "Already pending, or name taken: taken-repo", "GitHub refused: boom-repo",
         ])
 
     def test_blocked_and_already_done_tasks_are_never_transferred(self):
@@ -210,7 +210,8 @@ class CliTests(unittest.TestCase):
             code, out, _ = self.run_cli(gh, "-f", path, "--yes", "--wait", "0")
         self.assertEqual(code, cli.EXIT_OK)
         self.assertEqual(sorted(t[1] for t in gh.transfers), ["a", "b", "c"])
-        self.assertIn("3 done   0 pending   0 failed", out)
+        self.assertIn("3 done", out)
+        self.assertNotIn("pending", out)
 
     def test_pending_exit_code(self):
         gh = FakeGitHub(polls_until_moved=None)
@@ -233,9 +234,8 @@ class CliTests(unittest.TestCase):
         gh.add_repo("old", "app", admin=False, private=True)
         code, out, _ = self.run_cli(gh, "app", "missing")
         self.assertEqual(code, cli.EXIT_FAILED)
-        self.assertIn("Signed in as  someone-else", out)
-        self.assertIn("How to unblock", out)
-        self.assertIn("Sign in as old", out)
+        self.assertIn("signed in as someone-else", out)
+        self.assertIn("Sign in as old, not someone-else", out)
         self.assertIn("gh auth login", out)
         self.assertIn("GH_MIGRATE_TOKEN", out)
 
@@ -243,7 +243,7 @@ class CliTests(unittest.TestCase):
         gh = FakeGitHub()
         gh.add_repo("old", "app", admin=False)
         _, out, _ = self.run_cli(gh, "app")
-        self.assertIn("Get admin access to app", out)
+        self.assertIn("Use a token with admin access: app", out)
         self.assertIn("Administration: Read and write", out)
         self.assertNotIn("Sign in as", out)
 
@@ -252,7 +252,7 @@ class CliTests(unittest.TestCase):
         gh.users["old"] = "Organization"
         gh.add_repo("old", "app", admin=False)
         _, out, _ = self.run_cli(gh, "app")
-        self.assertIn("organization owner", out)
+        self.assertIn("Ask an owner of old for admin access: app", out)
         self.assertNotIn("Sign in as", out)
 
     def test_output_is_plain_ascii_when_not_a_terminal(self):
@@ -283,13 +283,13 @@ class AdviceTests(unittest.TestCase):
             RepoTask("c", READY),
         ]
         headings = [item.heading for item in advise(tasks, self.ctx())]
-        self.assertEqual(headings, ["Check the name of b", "Free up the name in new: a"])
+        self.assertEqual(headings, ["Not found: b", "new already has: a"])
 
     def test_token_from_environment_says_to_replace_it(self):
         tasks = [RepoTask("a", BLOCKED, cause=NO_ADMIN)]
         item = advise(tasks, self.ctx(me="other", token_origin="$GITHUB_TOKEN"))[0]
         text = " ".join(item.body)
-        self.assertIn("GITHUB_TOKEN environment variable", text)
+        self.assertIn("GITHUB_TOKEN variable", text)
         self.assertNotIn("gh auth login", text)
 
     def test_windows_gets_powershell_syntax(self):

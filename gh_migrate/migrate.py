@@ -12,7 +12,7 @@ BLOCKED = "blocked"
 
 # Transfer outcomes
 VERIFIED = "transferred"
-UNVERIFIED = "transferred (unverified)"
+UNVERIFIED = "unverified"
 PENDING = "pending"
 FAILED = "failed"
 
@@ -34,7 +34,6 @@ class RepoTask:
     detail: str = ""
     cause: str = ""
     repo_id: int = 0
-    private: bool | None = None  # unknown until the repository has been found
 
 
 def same(a, b):
@@ -45,18 +44,18 @@ def preflight(gh, source, target, name):
     """Decide whether `source/name` can be transferred to `target`, without changing anything."""
     repo = gh.get(f"/repos/{source}/{name}")
     if repo is None:
-        return RepoTask(name, BLOCKED, f"not found under {source}", cause=NOT_FOUND)
+        return RepoTask(name, BLOCKED, "not found", cause=NOT_FOUND)
 
-    task = RepoTask(repo["name"], repo_id=repo["id"], private=repo["private"])
+    task = RepoTask(repo["name"], repo_id=repo["id"])
     owner = repo["owner"]["login"]
     if same(owner, target):
-        task.status, task.detail = ALREADY, f"already owned by {target}"
+        task.status = ALREADY
     elif not same(owner, source):
-        task.status, task.detail, task.cause = BLOCKED, f"now lives at {repo['full_name']}", MOVED
+        task.status, task.detail, task.cause = BLOCKED, f"now at {repo['full_name']}", MOVED
     elif not repo.get("permissions", {}).get("admin"):
-        task.status, task.detail, task.cause = BLOCKED, "token has no admin permission on it", NO_ADMIN
+        task.status, task.detail, task.cause = BLOCKED, "no admin access", NO_ADMIN
     elif gh.get(f"/repos/{target}/{task.name}") is not None:
-        task.status, task.detail, task.cause = BLOCKED, f"{target} already has a repo with this name", NAME_TAKEN
+        task.status, task.detail, task.cause = BLOCKED, f"name taken in {target}", NAME_TAKEN
     return task
 
 
@@ -110,7 +109,7 @@ def transfer_all(gh, source, target, tasks, *, wait, interval=5.0, on_update=Non
                 continue
             task.status = status
             if status == UNVERIFIED:
-                task.detail = f"left {source}; not visible to this token, confirm in the {target} account"
+                task.detail = f"left {source}, but not visible to this token; check {target}"
             notify(task)
         in_flight = still_pending
         if not in_flight or clock() >= deadline:
@@ -118,5 +117,5 @@ def transfer_all(gh, source, target, tasks, *, wait, interval=5.0, on_update=Non
         sleep(interval)
 
     for task in in_flight:
-        task.detail = "transfer requested; still waiting for the new owner to accept"
+        task.detail = "awaiting acceptance"
         notify(task)
