@@ -59,6 +59,24 @@ def preflight(gh, source, target, name):
     return task
 
 
+def preflight_via(src, dst, source, via, target, name):
+    """Preflight for a two-hop move, `source` -> organization `via` -> `target`.
+
+    `src` is signed in as the source and `dst` as the target. Returns the task and whether it
+    still needs the first hop: a repo already in `via` (an earlier run stopped halfway) only
+    needs the second.
+    """
+    repo = src.get(f"/repos/{source}/{name}")
+    if repo is not None and same(repo["owner"]["login"], via):
+        return preflight(dst, via, target, repo["name"]), False
+    if repo is not None and same(repo["owner"]["login"], target):
+        return RepoTask(repo["name"], ALREADY, repo_id=repo["id"]), False
+    task = preflight(src, source, via, name)
+    if task.status == READY and dst.get(f"/repos/{target}/{task.name}") is not None:
+        task.status, task.detail, task.cause = BLOCKED, f"name taken in {target}", NAME_TAKEN
+    return task, True
+
+
 def _check_progress(gh, source, target, task):
     """One look at where the repository is now: PENDING, VERIFIED or UNVERIFIED.
 

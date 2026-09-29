@@ -75,7 +75,7 @@ Install as a command instead with `pip install .`, then run `gh-migrate ...`.
 ## Usage
 
 ```text
-gh-migrate --source ACCOUNT --target ACCOUNT [REPO ...] [-f FILE] [--dry-run] [-y] [--wait SECONDS]
+gh-migrate --source ACCOUNT --target ACCOUNT [REPO ...] [-f FILE] [--dry-run] [-y] [--wait SECONDS] [--via ORG]
 ```
 
 | Option | Meaning |
@@ -87,6 +87,7 @@ gh-migrate --source ACCOUNT --target ACCOUNT [REPO ...] [-f FILE] [--dry-run] [-
 | `--dry-run` | Run every check, transfer nothing. |
 | `-y`, `--yes` | Skip the "type the target name" confirmation. |
 | `--wait SECONDS` | How long to wait for transfers to complete. Default `120`. |
+| `--via ORG` | Move through an organization the target owns, so a personal target needs no email. See [below](#skip-the-email-with---via). |
 
 ### Authentication
 
@@ -132,6 +133,21 @@ The tool prints who it is signed in as. If that isn't the source account, it tel
 
 For a personal target the tool reports `pending` and exits with `3`. Once the requests are accepted, run the same command again to confirm. Repos that have arrived show as `already migrated`.
 
+### Skip the email with `--via`
+
+If the emails never arrive, route the move through an organization. Each repo goes `SOURCE -> ORG` as the source account, then `ORG -> TARGET` as the target account. Both steps finish without an email: the first because the source may create repos in the org, the second because the target is moving the repo into its own account.
+
+1. Signed in as the target, create a free org at [github.com/organizations/plan](https://github.com/organizations/plan).
+2. Invite the source account under the org's *People* tab, as an **owner** so it can still see private repos once they're in the org. Accept the invitation as the source.
+3. Log `gh` in as both accounts (`gh auth login` twice; `gh auth status` lists both).
+4. Run the usual command with `--via ORG`, dry run first:
+
+   ```sh
+   python -m gh_migrate --source OLD --target NEW --via ORG -f repos.txt --dry-run
+   ```
+
+The source account's token is found as usual; the target's comes only from its `gh` login. If a run stops halfway, re-run it: repos already in the org skip the first step. Delete the org once it's empty.
+
 ## Troubleshooting
 
 The tool prints the fix for each problem it finds. The common ones:
@@ -143,7 +159,7 @@ The tool prints the fix for each problem it finds. The common ones:
 | `not found` | Typo, or the repo isn't visible to this token. | `gh repo list SOURCE --limit 200` |
 | `name taken in TARGET` | The target already has a repo with that name. | Rename or delete it there. The tool never overwrites. |
 | `Repository has already been taken` | A transfer is already pending, or the name is taken. | Accept the emailed request, or cancel it under the repo's *Settings › Danger Zone*, then re-run. |
-| `pending`, but no email arrives | The target account's email is unverified or unwatched. | Check spam and [github.com/settings/emails](https://github.com/settings/emails) on the target account. |
+| `pending`, but no email arrives | The target account's email is unverified or unwatched. | Check spam and [github.com/settings/emails](https://github.com/settings/emails) on the target account, or use [`--via`](#skip-the-email-with---via). |
 
 ## How it works
 
@@ -155,7 +171,7 @@ The tool prints the fix for each problem it finds. The common ones:
 6. Poll until each repo shows up at the target, up to `--wait` seconds. A repo's numeric id survives a transfer, so a matching id proves it is the same repo.
 7. Print a summary, any fixes and the exit code.
 
-The tool never clones, deletes, renames or force-overwrites anything, and makes no write calls other than the transfer request.
+The tool never clones, deletes, renames or force-overwrites anything, and makes no write calls other than the transfer requests.
 
 | File | Role |
 | --- | --- |

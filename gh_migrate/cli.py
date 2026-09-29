@@ -6,7 +6,8 @@ import sys
 from .advice import Context, advise
 from .github import ApiError, GitHubClient, resolve_token
 from .migrate import (
-    ALREADY, BLOCKED, DONE, FAILED, PENDING, READY, UNVERIFIED, VERIFIED, preflight, same, transfer_all,
+    ALREADY, BLOCKED, DONE, FAILED, PENDING, READY, UNVERIFIED, VERIFIED, preflight, preflight_via, same,
+    transfer_all,
 )
 from .ui import Console
 
@@ -39,6 +40,9 @@ def build_parser():
     parser.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
     parser.add_argument("--wait", type=int, default=120, metavar="SECONDS",
                         help="how long to wait for transfers to complete (default: 120)")
+    parser.add_argument("--via", metavar="ORG",
+                        help="move through an organization the target owns, so a personal target "
+                        "needs no emailed acceptance (needs a gh login for both accounts)")
     return parser
 
 
@@ -63,12 +67,14 @@ def collect_names(args, parser):
     return names
 
 
-def main(argv=None, *, client=None):
+def main(argv=None, *, client=None, target_client=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     names = collect_names(args, parser)
     if same(args.source, args.target):
         parser.error("--source and --target are the same account")
+    if args.via and (same(args.via, args.source) or same(args.via, args.target)):
+        parser.error("--via must be an organization other than --source and --target")
 
     origin = None
     if client is None:
@@ -77,10 +83,15 @@ def main(argv=None, *, client=None):
             parser.error("no GitHub token found; run `gh auth login` or set GH_MIGRATE_TOKEN")
         token, origin = found
         client = GitHubClient(token)
+    if args.via and target_client is None:
+        found = resolve_token(args.target, only_gh_login=True)
+        if not found:
+            parser.error(f"--via also needs a gh login for {args.target}; run `gh auth login` as {args.target}")
+        target_client = GitHubClient(found[0])
 
     out = Console()
     try:
-        return run(client, args, names, out, origin)
+        return run(client, args, names, out, origin, target_client)
     except ApiError as err:
         out.line()
         bullet(out, out.paint(out.glyph("fail"), "red"), f"GitHub API error: {err}", "red")
@@ -127,18 +138,44 @@ def print_header(out, args, me):
     out.line()
     out.line("  " + paint("gh-migrate", "bold") + "  " + paint(args.source, "cyan", "bold")
              + f" {paint(out.glyph('arrow'), 'dim')} " + paint(args.target, "cyan", "bold")
+             + (paint(f"  via {args.via}", "dim") if args.via else "")
              + (paint("  (dry run)", "yellow") if args.dry_run else ""))
     out.line("  " + paint(f"signed in as {me}", "dim"))
     out.line()
 
 
-def run(gh, args, names, out, token_origin):
+def via_problem(src, dst, args):
+    """Why the route through `args.via` can't work, or None if it can."""
+    if not same(dst.get("/user")["login"], args.target):
+        return f"The second login must be {args.target}. Run `gh auth login` and sign in as {args.target}."
+    org = src.get(f"/users/{args.via}")
+    if org is None or org["type"] != "Organization":
+        return f"{args.via} is not an organization. Create one at https://github.com/organizations/plan"
+    for gh, account, need_owner in ((src, args.source, False), (dst, args.target, True)):
+        membership = gh.get(f"/user/memberships/orgs/{args.via}")
+        if not membership or membership["state"] != "active" or (need_owner and membership["role"] != "admin"):
+            return (f"{account} must be {'an owner' if need_owner else 'a member'} of {args.via}. "
+                    f"Invite it at https://github.com/orgs/{args.via}/people and accept the invitation.")
+    return None
+
+
+def run(gh, args, names, out, token_origin, target_gh=None):
     ctx = connect(gh, args, out, token_origin)
     if ctx is None:
         return EXIT_FAILED
+    problem = via_problem(gh, target_gh, args) if args.via else None
+    if problem:
+        out.line()
+        notice(out, "fail", problem + " Nothing was changed.")
+        return EXIT_FAILED
     print_header(out, args, ctx.me)
 
-    tasks = [preflight(gh, args.source, args.target, name) for name in names]
+    if args.via:
+        plans = [preflight_via(gh, target_gh, args.source, args.via, args.target, name) for name in names]
+        tasks = [task for task, _ in plans]
+        first_hop = [task for task, needed in plans if needed]
+    else:
+        tasks = [preflight(gh, args.source, args.target, name) for name in names]
     if all(task.status == READY for task in tasks):
         notice(out, "ok", f"{len(tasks)} ready: {', '.join(task.name for task in tasks)}")
     else:
@@ -161,7 +198,7 @@ def run(gh, args, names, out, token_origin):
         out.line("    " + out.paint("Dry run: nothing changed. Re-run without --dry-run to transfer.", "dim"))
         return EXIT_OK
 
-    if not ctx.target_is_org:
+    if not ctx.target_is_org and not args.via:
         notice(out, "warn", f"{args.target} is a personal account and must accept each transfer by email.")
     if not args.yes and not confirmed(out, args.target, len(todo)):
         out.line()
@@ -170,9 +207,31 @@ def run(gh, args, names, out, token_origin):
 
     out.line()
     width = max(len(name) for name in names)
-    transfer_all(gh, args.source, args.target, todo, wait=args.wait,
-                 on_update=lambda task: show_task(out, task, width))
+
+    def show(task):
+        show_task(out, task, width)
+
+    if args.via:
+        move_via(gh, target_gh, args, [task for task in first_hop if task.status == READY], todo, show)
+    else:
+        transfer_all(gh, args.source, args.target, todo, wait=args.wait, on_update=show)
     return summarize(out, tasks, ctx)
+
+
+def move_via(src, dst, args, first_hop, todo, show):
+    """source -> via as the source account, then via -> target as the target account.
+
+    The second hop moves each repo into the account that asks for it, which GitHub completes
+    without an emailed acceptance. Only repos that made it into `via` go on; the rest are shown
+    where they stopped.
+    """
+    transfer_all(src, args.source, args.via, first_hop, wait=args.wait,
+                 on_update=lambda task: None if task.status in DONE else show(task))
+    for task in first_hop:
+        if task.status in DONE:
+            task.status, task.detail = READY, ""
+    transfer_all(dst, args.via, args.target, [task for task in todo if task.status == READY],
+                 wait=args.wait, on_update=show)
 
 
 def summarize(out, tasks, ctx):

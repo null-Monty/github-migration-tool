@@ -79,19 +79,20 @@ def _describe(item):
     return fields or json.dumps(item)
 
 
-def resolve_token(source):
+def resolve_token(account, *, only_gh_login=False):
     """Find a token and say where it came from, as (token, origin); None if there isn't one.
 
-    Environment first, then the gh CLI: the source account's login if gh has one, else whichever
-    account is active.
+    Environment first, then the gh CLI: the account's login if gh has one, else whichever
+    account is active. With `only_gh_login`, just the gh login for `account` counts; that's how
+    a second account is signed in next to the first.
     """
-    for var in TOKEN_ENV_VARS:
-        if os.environ.get(var):
-            return os.environ[var], f"${var}"
-    attempts = (
-        (["gh", "auth", "token", "--user", source], f"gh CLI login for {source}"),
-        (["gh", "auth", "token"], "gh CLI active account"),
-    )
+    if not only_gh_login:
+        for var in TOKEN_ENV_VARS:
+            if os.environ.get(var):
+                return os.environ[var], f"${var}"
+    attempts = [(["gh", "auth", "token", "--user", account], f"gh CLI login for {account}")]
+    if not only_gh_login:
+        attempts.append((["gh", "auth", "token"], "gh CLI active account"))
     for command, origin in attempts:
         try:
             result = subprocess.run(command, capture_output=True, text=True, timeout=15)

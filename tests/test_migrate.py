@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import io
 import json
 import os
@@ -12,7 +13,8 @@ from gh_migrate.advice import Context, advise
 from gh_migrate.github import ApiError, _error_message
 from gh_migrate.migrate import (
     ALREADY, ALREADY_TAKEN, BLOCKED, FAILED, NAME_TAKEN, NO_ADMIN, NOT_FOUND, PENDING, READY, REFUSED,
-    UNVERIFIED, VERIFIED, RepoTask, preflight, transfer_all,
+    UNVERIFIED, VERIFIED, RepoTask, preflight, preflight_via,
+    transfer_all,
 )
 from gh_migrate.ui import Console
 
@@ -33,8 +35,15 @@ class FakeGitHub:
         self.pending = {}
         self.moved_ids = set()
         self.transfers = []
+        self.memberships = {}  # (org, login) -> {"role": ..., "state": ...}
         self.polls_until_moved = polls_until_moved
         self.target_can_see = target_can_see
+
+    def signed_in_as(self, login):
+        """The same GitHub, seen through `login`'s token."""
+        view = copy.copy(self)
+        view.me = login
+        return view
 
     def add_repo(self, owner, name, *, admin=True, private=False):
         self.repos[(owner.lower(), name.lower())] = {
@@ -46,6 +55,8 @@ class FakeGitHub:
         parts = path.strip("/").split("/")
         if parts == ["user"]:
             return {"login": self.me}
+        if parts[:3] == ["user", "memberships", "orgs"]:
+            return self.memberships.get((parts[3], self.me))
         if parts[0] == "users":
             return {"login": parts[1], "type": self.users[parts[1]]} if parts[1] in self.users else None
         _, owner, name = parts
@@ -326,3 +337,74 @@ class ErrorMessageTests(unittest.TestCase):
 
     def test_non_json_body_is_returned_as_is(self):
         self.assertEqual(self.message(b"<html>bad gateway</html>"), "<html>bad gateway</html>")
+
+
+class ViaTests(unittest.TestCase):
+    """--via: old -> hub (an org) as old, then hub -> new (a personal account) as new."""
+
+    def setUp(self):
+        self.gh = FakeGitHub(polls_until_moved=0)
+        self.gh.users.update(new="User", hub="Organization")
+        self.gh.memberships[("hub", "old")] = {"role": "member", "state": "active"}
+        self.gh.memberships[("hub", "new")] = {"role": "admin", "state": "active"}
+        self.as_new = self.gh.signed_in_as("new")
+
+    def run_cli(self, *argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = cli.main(["--source", "old", "--target", "new", "--via", "hub", *argv],
+                            client=self.gh, target_client=self.as_new)
+        return code, out.getvalue()
+
+    def test_both_hops_run_as_the_right_account(self):
+        self.gh.add_repo("old", "app")
+        code, out = self.run_cli("app", "--yes", "--wait", "0")
+        self.assertEqual(code, cli.EXIT_OK)
+        self.assertEqual(self.gh.transfers, [("old", "app", "hub"), ("hub", "app", "new")])
+        self.assertEqual(self.gh.get("/repos/new/app")["owner"]["login"], "new")
+        self.assertIn("via hub", out)
+        self.assertNotIn("accept", out)
+
+    def test_repo_left_in_the_org_by_an_earlier_run_only_needs_the_second_hop(self):
+        self.gh.add_repo("hub", "app")
+        self.gh.redirects[("old", "app")] = ("hub", "app")
+        task, first_hop = preflight_via(self.gh, self.as_new, "old", "hub", "new", "app")
+        self.assertEqual((task.status, first_hop), (READY, False))
+        self.run_cli("app", "--yes", "--wait", "0")
+        self.assertEqual(self.gh.transfers, [("hub", "app", "new")])
+
+    def test_name_taken_at_the_final_target_blocks_before_anything_moves(self):
+        self.gh.add_repo("old", "app")
+        self.gh.add_repo("new", "app")
+        code, out = self.run_cli("app", "--yes")
+        self.assertEqual(code, cli.EXIT_FAILED)
+        self.assertEqual(self.gh.transfers, [])
+        self.assertIn("name taken in new", out)
+
+    def test_failed_first_hop_is_not_sent_on(self):
+        self.gh.add_repo("old", "boom")
+        code, _ = self.run_cli("boom", "--yes", "--wait", "0")
+        self.assertEqual(code, cli.EXIT_FAILED)
+        self.assertEqual(self.gh.transfers, [])
+
+    def test_target_must_own_the_org(self):
+        self.gh.memberships[("hub", "new")]["role"] = "member"
+        self.gh.add_repo("old", "app")
+        code, out = self.run_cli("app", "--yes")
+        self.assertEqual(code, cli.EXIT_FAILED)
+        self.assertEqual(self.gh.transfers, [])
+        self.assertIn("new must be an owner of hub", out)
+
+    def test_second_login_must_be_the_target(self):
+        self.as_new = self.gh.signed_in_as("old")
+        self.gh.add_repo("old", "app")
+        code, out = self.run_cli("app", "--yes")
+        self.assertEqual(code, cli.EXIT_FAILED)
+        self.assertIn("second login must be new", out)
+
+    def test_via_must_be_an_organization(self):
+        self.gh.users["hub"] = "User"
+        self.gh.add_repo("old", "app")
+        code, out = self.run_cli("app", "--dry-run")
+        self.assertEqual(code, cli.EXIT_FAILED)
+        self.assertIn("hub is not an organization", out)
